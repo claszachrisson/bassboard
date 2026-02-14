@@ -1,0 +1,362 @@
+//
+// Created by Clas Zachrisson on 2025-04-18.
+//
+#include "codec.h"
+#include <array>
+#include <cstring>
+#include <rom/ets_sys.h>
+#include <algorithm>
+
+#include "esp_attr.h"
+
+i2s_chan_handle_t Codec::tx_handle;
+i2s_chan_handle_t Codec::rx_handle;
+
+constexpr int DMA_FRAME_NUM_SAMPLES = 120;
+// constexpr int RING_BUF_ITEM_SIZE = 1024;
+constexpr int STREAMBUF_N_FRAMES = 12;
+constexpr size_t STREAMBUF_SIZE = DMA_FRAME_NUM_SAMPLES * sizeof(uint16_t) * STREAMBUF_N_FRAMES;
+constexpr size_t STREAMBUF_TRIG_LVL = DMA_FRAME_NUM_SAMPLES * sizeof(uint16_t) * 3;
+
+TaskHandle_t Codec::stream_task_handle = nullptr;
+StreamBufferHandle_t xStreamBuffer;
+StaticStreamBuffer_t StreamBufferStruct;
+static uint8_t ucStorageBuffer[STREAMBUF_SIZE];
+
+
+// TaskHandle_t Codec::bytebuf_task_handler = nullptr;
+// RingbufHandle_t bytebuf = xRingbufferCreate(RING_BUF_ITEM_SIZE, RINGBUF_TYPE_BYTEBUF);
+bool Codec::send_task_running = false;
+
+Codec::Codec(IOExpander* io_expander)
+    : I2CDevice(0x18, "Codec"),
+    io_expander(io_expander),
+    sample_rate(44100)
+{
+    xStreamBuffer = xStreamBufferCreateStatic(
+        sizeof(ucStorageBuffer),
+        STREAMBUF_TRIG_LVL,
+        ucStorageBuffer,
+        &StreamBufferStruct
+    );
+    io_expander->set_direction(EXIO_NUM_01, IOExpander::OUTPUT);
+    io_expander->set_level(EXIO_NUM_01, 0);
+
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = 6;
+    chan_cfg.dma_frame_num = DMA_FRAME_NUM_SAMPLES * 2;
+    i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle);
+
+    i2s_pdm_rx_config_t pdm_rx_cfg = {
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(sample_rate, I2S_CLK_SRC_APLL),
+        .slot_cfg = I2S_PDM_RX_SLOT_PCM_FMT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO, I2S_PDM_SLOT_LEFT),
+        .gpio_cfg = {
+            .
+        },
+    };
+    slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = clk_cfg,
+        .slot_cfg = slot_cfg,
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = GPIO_NUM_33,
+            .ws = GPIO_NUM_25,
+            .dout = GPIO_NUM_26,
+            .din = GPIO_NUM_27,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    i2s_channel_init_std_mode(tx_handle, &std_cfg);
+    i2s_channel_init_std_mode(rx_handle, &std_cfg);
+
+    i2s_event_callbacks_t rx_callbacks = {
+        .on_recv = i2s_rx_cb,
+    };
+    i2s_event_callbacks_t tx_callbacks = {
+        .on_sent = i2s_tx_sent_cb,
+    };
+    i2s_channel_register_event_callback(rx_handle, &rx_callbacks, nullptr);
+    i2s_channel_register_event_callback(tx_handle, &tx_callbacks, nullptr);
+
+    i2s_channel_enable(tx_handle);
+    i2s_channel_enable(rx_handle);
+
+    io_expander->set_level(EXIO_NUM_01, 1);
+
+    const std::array<i2c_pair, 39> init_sequence = {{
+        {0x00, 0x00}, // pg 0
+        {0x01, 0x01}, // sw reset
+        {0x04, 0x07}, // PLL_CLKIN = BCLK, CODEC_CLKIN = PLL_CLK
+        {0x05, 0x16}, // PLL P=1, R=6, PLL powered down
+        {0x06, 0x0a}, // PLL J=10
+        {0x07, 0x00}, // PLL D MSB = 0
+        {0x08, 0x00}, // PLL D LSB = 0
+        {0x05, 0x96}, // PLL powered on
+        {0x12, 0x83}, // NADC 3, powered on
+        {0x13, 0x8a}, // MADC 10, powered on
+        {0x14, 0x40}, // AOSR_VAL = 64
+        {0x0b, 0x83}, // NDAC 3
+        {0x0c, 0x8a}, // MDAC 10
+        {0x0d, 0x00}, // DOSR_VAL MSB
+        {0x0d, 0x40}, // DOSR_VAL LSB = 64
+        {0x1b, 0xc0}, // LJ audio, 16-bit
+        {0x3d, 0x0a}, // PRB_R10
+        {0x3c, 0x0a}, // PRB_P10
+        {0x00, 0x08}, // pg 8
+        {0x01, 0x04}, // Adaptive filtering enabled in DAC
+        {0x00, 0x00}, // pg 0
+        {0x00, 0x01}, // pg 1
+        {0x1f, 0x04}, // HPOUT CM 1V35
+        {0x21, 0x4e}, // Depop
+        {0x23, 0x80}, // DAC to HPOUT
+        {0x28, 0x06}, // Unmute HPOUT, 0 dB
+        {0x2c, 0x04}, // HPOUT in Line out mode
+        {0x24, 0x00}, // HPOUT analog gain 0 dB
+        {0x1f, 0x86}, // HPOUT power up
+        {0xFF, 0xFF}, // Wait
+        {0x30, 0x80}, // MIC1LP, 20kOhm
+        {0x31, 0x80}, // CM, 20kOhm
+        //{0x2f, 0x0F}, // PGA gain ???
+        {0x00, 0x00}, // pg 0
+        {0x51, 0x80}, // power up ADC
+        {0x3f, 0xb4}, // Power up DAC, right data
+        {0x41, 0x00}, // DAC gain 0 dB
+        {0xFF, 0xFF}, // Wait
+        {0x52, 0x00}, // unmute ADC
+        {0x40, 0x04}, // Unmute DAC
+    }};
+
+    this->register_write_random(init_sequence);
+
+    // this->main_ringbuf_task_start();
+    this->start_stream_send_task();
+}
+
+IRAM_ATTR bool Codec::i2s_rx_cb(i2s_chan_handle_t, i2s_event_data_t *event, void*)
+{
+    // ESP_LOGI("dma", "received %d bytes", event->size);
+    if (!send_task_running) return false;
+
+    // ets_printf("received %d bytes\n", event->size);
+    static uint16_t mono_buf[DMA_FRAME_NUM_SAMPLES];
+    auto data = static_cast<uint16_t*>(event->dma_buf);
+    int n_samples = event->size / 4;
+
+    for (int i = 0; i < n_samples; i++) {
+        mono_buf[i] = data[i * 2]; // left channel
+    }
+
+    size_t bytes = xStreamBufferSendFromISR(
+        xStreamBuffer,
+        mono_buf,
+        n_samples * sizeof(uint16_t),
+        nullptr
+    );
+    if (bytes & 1) ets_printf("sent odd number of bytes");
+    if (bytes != n_samples * sizeof(uint16_t)) {
+        ets_printf("not enough space in buffer\n");
+    }
+
+    return false;
+}
+
+IRAM_ATTR bool Codec::i2s_tx_sent_cb(i2s_chan_handle_t, i2s_event_data_t*, void*)
+{
+    if (!send_task_running) return false;
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(stream_task_handle, &woken);
+    return woken == pdTRUE;
+}
+
+void Codec::start_stream_send_task()
+{
+    ESP_LOGI("codec", "Starting stream send task");
+    if (pdPASS != xTaskCreatePinnedToCore( stream_send_task, "stream_send",
+        4096, nullptr, 3, &stream_task_handle, tskNO_AFFINITY ))
+    {
+        ESP_LOGE(this->device_name, "Error creating stream task");
+    }
+}
+
+size_t StreamBufferReceive(uint8_t* buffer, size_t size, TickType_t ticks_to_wait=portMAX_DELAY)
+{
+    return xStreamBufferReceive(xStreamBuffer, buffer, size, ticks_to_wait);
+}
+
+void Codec::stream_send_task(void* arg)
+{
+    size_t written = 0;
+    ESP_LOGI("codec", "Started bytebuf task");
+    send_task_running = true;
+    uint8_t tx_buf[DMA_FRAME_NUM_SAMPLES*2];// = {};
+
+    size_t bytes = StreamBufferReceive(tx_buf, sizeof(tx_buf), portMAX_DELAY);
+    // size_t bytes = sizeof(tx_buf);
+
+    i2s_channel_write(tx_handle, tx_buf, bytes, &written, portMAX_DELAY);
+
+    while (true)
+    {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // size_t bytes = StreamBufferReceive(tx_buf, sizeof(tx_buf), 0);
+        // if (bytes & 1) ets_printf("received odd number of bytes");
+        // if (bytes < sizeof(tx_buf)) {
+        //     // underrun protection: zero-fill
+        //     memset((uint8_t*)tx_buf + bytes, 0, sizeof(tx_buf) - bytes);
+        //     bytes = sizeof(tx_buf);
+        // }
+        StreamBufferReceive(
+            tx_buf,
+            sizeof(tx_buf),
+            portMAX_DELAY   // WAIT, do not pad
+        );
+
+        // for (int i=0;i<DMA_FRAME_NUM_SAMPLES;i+=2)
+        // {
+        //     // const uint16_t tmp = tx_buf[i];
+        //     // tx_buf[i] = tx_buf[i+1];
+        //     // tx_buf[i+1] = tmp;
+        //     std::swap(tx_buf[i], tx_buf[i+1]);
+        // }
+        i2s_channel_write(
+           tx_handle,
+           tx_buf,
+           sizeof(tx_buf),
+           &written,
+           portMAX_DELAY
+       );
+    }
+}
+// void Codec::start_bytebuf_send_task()
+// {
+//     ESP_LOGI("codec", "Starting bytebuf send task");
+//     if (pdPASS != xTaskCreatePinnedToCore( bytebuf_send_task, "bytebuf_send",
+//         2048, nullptr, 2, &bytebuf_task_handler, tskNO_AFFINITY ))
+//     {
+//         ESP_LOGE(this->device_name, "Error creating ringbuffer task");
+//     }
+// }
+//
+// void Codec::bytebuf_send_task(void* arg)
+// {
+//     size_t written = 0;
+//     ESP_LOGI("codec", "Started bytebuf task");
+//     send_task_running = true;
+//     while (true)
+//     {
+//         size_t received;
+//         auto samples = static_cast<uint16_t*>(
+//             xRingbufferReceive(bytebuf, &received, portMAX_DELAY)
+//         );
+//         if (received)
+//         {
+//             for (int i=0;i<received/2;i+=2)
+//             {
+//                 const uint16_t tmp = samples[i];
+//                 samples[i] = samples[i+1];
+//                 samples[i+1] = tmp;
+//             }
+//             i2s_channel_write(
+//                tx_handle,
+//                samples,
+//                received,
+//                &written,
+//                portMAX_DELAY
+//            );
+//         }
+//
+//         vRingbufferReturnItem(bytebuf, samples);
+//     }
+// }
+
+// void Codec::main_ringbuf_task_start()
+// {
+//     i2s_ringBuffer_handler = xRingbufferCreateNoSplit( RING_BUF_ITEM_SIZE, 2048 / RING_BUF_ITEM_SIZE );
+//     if (!i2s_ringBuffer_handler)
+//     {
+//         ESP_LOGE(this->device_name, "Error creating ringbuffer");
+//     }
+//     else
+//     {
+//         if (pdPASS != xTaskCreatePinnedToCore( i2s_ring_buffer_task_128, "i2s_RBT",
+//         //if (pdPASS != xTaskCreatePinnedToCore( i2s_silence, "i2s_RBT",
+//             1024, nullptr, 2, &i2s_ringBufferTask_handler, tskNO_AFFINITY ))
+//         {
+//             ESP_LOGE(this->device_name, "Error creating ringbuffer task");
+//         }
+//     }
+// }
+// void Codec::main_ringbuf_task_suspend()
+// {
+//     vTaskSuspend(i2s_ringBufferTask_handler);
+// }
+//
+// void Codec::enable_long_ringbuf()
+// {
+//     i2s_ringBuffer_1024_handler = xRingbufferCreateNoSplit( 1024, 4 );
+//     if (!i2s_ringBuffer_1024_handler)
+//     {
+//         ESP_LOGE(this->device_name, "Error creating ringbuffer");
+//     }
+//     else
+//     {
+//         if (pdPASS != xTaskCreatePinnedToCore( i2s_ring_buffer_task_128, "i2s_RBT",
+//             1024, nullptr, 2, &i2s_ringBufferTask_handler, tskNO_AFFINITY ))
+//         {
+//             ESP_LOGE(this->device_name, "Error creating ringbuffer task");
+//         }
+//     }
+// }
+
+// void Codec::i2s_silence(void* arg)
+// {
+//     size_t bytes_written = 0;
+//
+//     auto* mem = static_cast<uint8_t*>(calloc(1, RING_BUF_ITEM_SIZE));  // calloc initializes to zeros
+//     if (!mem) {
+//         ESP_LOGE("Codec", "Failed to allocate memory");
+//         vTaskDelete(nullptr);
+//     }
+//
+//     ESP_LOGI("Codec", "I2S ringbuffer 128 task started — writing zeros");
+//
+//     while (true) {
+//         // Continuously write zeros to I2S
+//         esp_err_t err = i2s_channel_write(tx_handle, mem, RING_BUF_ITEM_SIZE, &bytes_written, portMAX_DELAY);
+//         if (err != ESP_OK) {
+//             ESP_LOGW("Codec", "Failed to write to I2S channel: %d", err);
+//         }
+//     }
+// }
+
+// int32_t Codec::a2dp_data_cb_nonblocking(uint8_t * buf, const int32_t len)
+// {
+//     if (len < 0 || buf == nullptr) return 0;
+//     size_t item_size = 0;
+//     auto *ringBufferItem = static_cast<uint8_t*>(xRingbufferReceive(i2s_ringBuffer_handler, &item_size, 0));
+//     if (!ringBufferItem)
+//     {
+//         ESP_LOGW("Codec", "Failed to receive data from I2S ring buffer");
+//         return 0;
+//     }
+//     memcpy(buf, ringBufferItem, len);
+//     vRingbufferReturnItem( i2s_ringBuffer_handler, ringBufferItem );
+//     return item_size;
+// }
+
+// int level = 0;
+// int32_t Codec::noise(uint8_t *buf, const int32_t len)
+// {
+//     for (int i = 0; i < len; ++i) {
+//         buf[i] = level;//buf[i] = rand() % 64;  // white noise
+//     }
+//     level = !level;
+//     return len;
+// }

@@ -1,0 +1,3 @@
+[submodule "external/ccea"]
+	path = external/ccea
+	url = git@github.com:claszachrisson/ccea.git

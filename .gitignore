@@ -1,0 +1,5 @@
+build/
+.idea
+sdkconfig
+sdkconfig.old
+.DS_Store
