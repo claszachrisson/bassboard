@@ -1,22 +1,26 @@
-//
-// Created by Clas Zachrisson on 2025-04-21.
-//
-
-#ifndef LCD_H
-#define LCD_H
-
-//#include "i2c_device.h"
+#pragma once
+#include "dsp_types.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "io_expander.h"
-#include "driver/ledc.h"
+#include "freertos/semphr.h"
+#include <vector>
 
-class LCD {//: public I2CDevice {
+// Firmware-lifetime device. Only task_main accesses LVGL or the panel.
+class LCD {
 public:
-    LCD(IOExpander* io_expander);
+    explicit LCD(int capacity);
+    LCD(const LCD&) = delete;
+    LCD& operator=(const LCD&) = delete;
+    static void block_changed(int slot, const DSPBlockSnapshot& snapshot, void* ctx);
+    void set_brightness(uint8_t brightness);
+    void request_hardware_reset();
 private:
-    IOExpander* io_expander;
-
+    static void task_main(void* ctx);
+    void run();
+    SemaphoreHandle_t model_mutex_ = nullptr;
+    TaskHandle_t task_ = nullptr;
+    std::vector<DSPBlockSnapshot> model_;
+    bool dirty_ = true;
+    bool reset_requested_ = false;
+    uint8_t brightness_ = 128;
 };
-
-#endif //LCD_H

@@ -5,7 +5,7 @@
 #ifndef IO_EXPANDER_H
 #define IO_EXPANDER_H
 
-#include "i2c_device.h"
+#include "lib_i2c.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -32,37 +32,22 @@ enum external_gpio
     EXIO_NUM_17 = 0x17,
 };
 
-class IOExpander : public I2CDevice {
-public:
-    static int OUTPUT;
-    static int INPUT;
+static constexpr int IOEX_OUTPUT = 0;
+static constexpr int IOEX_INPUT = 1;
 
-    IOExpander();
-    void set_direction(uint8_t exio_num, int dir);
-    void set_level(uint8_t exio_num, int level);
-private:
-    static QueueHandle_t intr_evt_queue;
-    static TimerHandle_t debounce_timer;
-
-    uint8_t io_dirs[2] = {0xFF, 0xFF}; // Inputs by default
-    uint8_t output_levels[2] = {0xFF, 0xFF}; // HIGH by default
-    enum control_port : uint8_t {
-        INPUT_PORT0 = 0x00,
-        INPUT_PORT1 = 0x01,
-        OUTPUT_PORT0 = 0x02,
-        OUTPUT_PORT1 = 0x03,
-        POL_INV_PORT0 = 0x04,
-        POL_INV_PORT1 = 0x05,
-        DIR_PORT0 = 0x06,
-        DIR_PORT1 = 0x07,
-    };
-
-    static void IRAM_ATTR isr_handler(void* arg);
-    static void isr_task(void* arg);
-    static void debounce_timer_cb(TimerHandle_t timer);
-
-    esp_err_t write_directions();
-    esp_err_t write_levels();
+enum ioex_switch_event_type
+{
+    IOEX_SWITCH_SHORT,
+    IOEX_SWITCH_LONG,
+    IOEX_SWITCH_DOUBLE,
 };
+
+typedef void (*ioex_switch_event_cb_t)(int port, int bit, ioex_switch_event_type type, uint32_t press_ms, void* user_ctx);
+
+esp_err_t ioex_init();
+void ioex_set_direction(uint8_t exio_num, int dir);
+void ioex_set_level(uint8_t exio_num, int level);
+void ioex_register_switch(uint8_t exio_num, bool active_low = true);
+void ioex_register_switch_event_cb(ioex_switch_event_cb_t cb, void* user_ctx = nullptr);
 
 #endif //IO_EXPANDER_H

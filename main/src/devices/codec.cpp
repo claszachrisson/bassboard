@@ -6,42 +6,32 @@
 #include <cstring>
 #include <rom/ets_sys.h>
 #include <algorithm>
+#include <bassboard_dsp.h>
 
 #include "esp_attr.h"
+
+static constexpr char TAG[] = "Codec";
 
 i2s_chan_handle_t Codec::tx_handle;
 i2s_chan_handle_t Codec::rx_handle;
 
-constexpr int DMA_FRAME_SIZE = 120; // samples
-constexpr int STREAMBUF_N_FRAMES = 3;
-constexpr size_t STREAMBUF_SIZE = DMA_FRAME_SIZE * STREAMBUF_N_FRAMES * sizeof(uint16_t);
+constexpr int DMA_FRAME_SIZE = 128; // samples
+constexpr int DMA_FRAME_SIZE_BYTES = DMA_FRAME_SIZE * sizeof(int16_t);
+static int16_t input_buffer[DMA_FRAME_SIZE*2] = {};
+static int16_t output_buffer[DMA_FRAME_SIZE*2] = {};
+static volatile int ready_frame = 0;
+static volatile int notify_frame = 0;
+static volatile int output_ready_frame = 0;
+volatile int Codec::output_frame = 0;
 
-TaskHandle_t Codec::stream_task_handle = nullptr;
-StreamBufferHandle_t xStreamBuffer;
-StaticStreamBuffer_t StreamBufferStruct;
-static uint8_t ucStorageBuffer[STREAMBUF_SIZE];
+TaskHandle_t Codec::dsp_task_handle = nullptr;
 
-bool Codec::transmitting = true;
-
-void consume_frame()
-{
-    uint16_t junk[DMA_FRAME_SIZE];
-    xStreamBufferReceiveFromISR(xStreamBuffer, junk, sizeof(junk), nullptr);
-}
-
-Codec::Codec(IOExpander* io_expander)
+Codec::Codec()
     : I2CDevice(0x18, "Codec"),
-    io_expander(io_expander),
     sample_rate(44100)
 {
-    xStreamBuffer = xStreamBufferCreateStatic(
-        sizeof(ucStorageBuffer),
-        1,
-        ucStorageBuffer,
-        &StreamBufferStruct
-    );
-    io_expander->set_direction(EXIO_NUM_01, IOExpander::OUTPUT);
-    io_expander->set_level(EXIO_NUM_01, 0);
+    ioex_set_direction(EXIO_NUM_01, IOEX_OUTPUT);
+    ioex_set_level(EXIO_NUM_01, 0);
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = 2;
@@ -82,7 +72,7 @@ Codec::Codec(IOExpander* io_expander)
     i2s_channel_enable(tx_handle);
     i2s_channel_enable(rx_handle);
 
-    io_expander->set_level(EXIO_NUM_01, 1);
+    ioex_set_level(EXIO_NUM_01, 1);
 
     const std::array<i2c_pair, 39> init_sequence = {{
         {0x00, 0x00}, // pg 0
@@ -131,81 +121,45 @@ Codec::Codec(IOExpander* io_expander)
 
     // this->main_ringbuf_task_start();
     // this->start_stream_send_task();
+    ESP_LOGI(TAG, "Initialised codec");
 }
 
 int Codec::get_frame_size() { return DMA_FRAME_SIZE; }
+int16_t* Codec::get_input_buffer() { return input_buffer; }
+int16_t* Codec::get_output_buffer() { return output_buffer; }
 
-void Codec::mute_output()   { transmitting = false; }
-void Codec::unmute_output() { transmitting = true;  }
+void Codec::set_output_frame_ready(const int frame_start)
+{
+    output_ready_frame = frame_start;
+}
+void Codec::set_dsp_task_handle(TaskHandle_t handle)
+{
+    dsp_task_handle = handle;
+}
+
+
+// void Codec::mute_output()   { transmitting = false; }
+// void Codec::unmute_output() { transmitting = true;  }
 
 IRAM_ATTR bool Codec::i2s_rx_cb(i2s_chan_handle_t, i2s_event_data_t *event, void*)
 {
-    // auto samples = static_cast<uint16_t*>(event->dma_buf);
-    // for (int i=0; i<event->size; i++)
-    // {
-    //     if (samples[i] & 0x80) ets_printf("doozy");
-    // }
-    if (event->size % DMA_FRAME_SIZE != 0) { ets_printf("recv only %d samples\n", event->size); return false; }
-    if (event->size > xStreamBufferSpacesAvailable(xStreamBuffer))
-    {
-        // ets_printf("not enough space in buffer\n");
-        consume_frame();
-    }
+    if (!dsp_task_handle) return false;
+    if (event->size != DMA_FRAME_SIZE_BYTES) { ets_printf("i2s rx cb size mismatch\n"); return false; }
+    // ets_printf("i2s rx cb, copying, ready_frame, DMA_FRAME_SIZE, event size: %d, %d, %d \n", ready_frame, DMA_FRAME_SIZE, event->size);
+    memcpy(&input_buffer[ready_frame*DMA_FRAME_SIZE], event->dma_buf, DMA_FRAME_SIZE_BYTES);
 
-    size_t bytes = xStreamBufferSendFromISR(
-        xStreamBuffer,
-        event->dma_buf,
-        event->size,
-        nullptr
-    );
+    notify_frame = ready_frame;
+    ready_frame = !ready_frame;
 
-    if (bytes & 1) {ets_printf("sent odd number of bytes"); return false; }
-    // if (bytes != event->size) {
-    //     ets_printf("not enough space in buffer\n");
-    // }
-
-    return false;
-}
-
-void Codec::read(int16_t* buffer, int frames)
-{
-    for (int f = 0; f < frames; f++)
-    {
-        streamBufferReceive(&buffer[f * DMA_FRAME_SIZE], DMA_FRAME_SIZE*sizeof(int16_t), portMAX_DELAY);
-        for (int i = 0; i < frames*DMA_FRAME_SIZE; i+=2)
-        {
-            std::swap(buffer[f*DMA_FRAME_SIZE + i], buffer[f*DMA_FRAME_SIZE + i + 1]);
-        }
-    }
-}
-void Codec::read(float* buffer, int frames)
-{
-    constexpr float scale = 1.0f / 32768.0f;
-    int16_t tmp[DMA_FRAME_SIZE];
-    for (int f = 0; f < frames; ++f)
-    {
-        streamBufferReceive(tmp, DMA_FRAME_SIZE*sizeof(int16_t), portMAX_DELAY);
-        for (int i = 0; i < DMA_FRAME_SIZE; i += 2)
-        {
-            buffer[f * DMA_FRAME_SIZE + i]     = tmp[i+1] * scale;
-            buffer[f * DMA_FRAME_SIZE + i + 1] = tmp[i]   * scale;
-        }
-    }
-}
-
-size_t Codec::streamBufferReceive(void* buffer, size_t size, TickType_t ticks_to_wait=portMAX_DELAY)
-{
-    return xStreamBufferReceive(xStreamBuffer, buffer, size, ticks_to_wait);
+    BaseType_t hp = pdFALSE;
+    xTaskNotifyFromISR(dsp_task_handle, notify_frame, eSetValueWithOverwrite, &hp);
+    // ets_printf("i2s rx cb, notified \n");
+    return hp == pdTRUE;
 }
 
 IRAM_ATTR bool Codec::i2s_tx_sent_cb(i2s_chan_handle_t, i2s_event_data_t* event, void*)
 {
-    if (!transmitting) return false;
-
-    streamBufferReceive(
-        event->dma_buf,
-        event->size,
-        0
-    );
+    memcpy(event->dma_buf, &output_buffer[output_ready_frame*DMA_FRAME_SIZE], event->size);
+    // output_ready_buffer = !output_ready_buffer; may be set by whatever writes to output buffer
     return false;
 }

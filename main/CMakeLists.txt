@@ -1,24 +1,52 @@
-# Recursively collect all source files in src/
-file(GLOB_RECURSE SOURCES
-        main.cpp
-#        "src/algorithms/*.c"
-        "src/algorithms/*.cpp"
-        "src/core/*.cpp"
-        "src/devices/*.cpp"
+idf_component_register(
+        SRCS
+            "main.cpp"
+            "src/algorithms/bassboard_dsp.cpp"
+            "src/algorithms/dsp_chorus.cpp"
+            "src/algorithms/dsp_compressor.cpp"
+            "src/algorithms/dsp_delay.cpp"
+            "src/algorithms/dsp_flanger.cpp"
+            "src/algorithms/dsp_overdrive.cpp"
+            "src/algorithms/dsp_phaser.cpp"
+            "src/algorithms/dsp_tremolo.cpp"
+            "src/algorithms/pitchyin.cpp"
+            "src/devices/codec.cpp"
+            "src/devices/encoder.cpp"
+            "src/devices/eeprom.cpp"
+            "src/devices/io_expander.cpp"
+            "src/devices/lcd.cpp"
+            "src/ui/ui.cpp"
+            "src/ui/fonts/card_bold_24.c"
+            "src/ui/fonts/card_bold_20.c"
+            "src/ui/fonts/card_bold_16.c"
+            "src/ui/lvgl_memory.c"
+            "src/devices/led_driver.cpp"
+            "../external/ccea/lib_i2c/src/lib_i2c.cpp"
+        INCLUDE_DIRS
+            "."
+            "src/core"
+            "src/ui"
+            "src/devices"
+            "src/algorithms"
+            "../external/ccea/lib_i2c/include"
+        REQUIRES
+            nvs_flash
+            esp_driver_i2s
+            lib_i2c
+            esp_driver_gpio
+            esp_driver_spi
+            esp_driver_ledc
+            esp_lcd
+            esp_timer
+            lvgl
+            esp_lcd_ili9488
 )
-
-set(INC_DIRS
-        "src/devices"
-#        "src/bt"
-        "src/algorithms"
-        "src/core"
+target_compile_options(
+        ${COMPONENT_LIB} PRIVATE
+        -Wno-missing-field-initializers
+        -Wno-error=missing-field-initializers
+        -Wno-unused-variable
 )
-
-#set(SOURCES main.cpp "src")
-idf_component_register(SRCS ${SOURCES}
-        INCLUDE_DIRS ${INC_DIRS}
-        REQUIRES i2c_device nvs_flash esp_driver_i2s esp_driver_gpio)
-
 #idf_build_get_property(project_dir PROJECT_DIR)
 #idf_build_set_property(CONFIG_KCONFIG_FILES "${project_dir}/main/Kconfig" APPEND)
 #idf_build_set_property(CONFIG_KCONFIG_FILES "Kconfig" APPEND)

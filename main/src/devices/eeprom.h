@@ -5,7 +5,7 @@
 #ifndef EEPROM_H
 #define EEPROM_H
 
-#include "i2c_device.h"
+#include "lib_i2c.h"
 
 class EEPROM : public I2CDevice {
 public:

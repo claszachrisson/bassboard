@@ -3,3 +3,6 @@ build/
 sdkconfig
 sdkconfig.old
 .DS_Store
+
+# Downloaded by the ESP-IDF Component Manager
+/managed_components/
